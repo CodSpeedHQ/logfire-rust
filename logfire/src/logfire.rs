@@ -39,13 +39,15 @@ use crate::internal::env::get_optional_env;
 use crate::{
     __macros_impl::LogfireValue,
     ConfigureError, LogfireConfigBuilder, ShutdownError,
-    bridges::tracing::LogfireTracingLayer,
+    bridges::tracing::{LogfireTracingLayer, tracing_level_to_severity},
     config::{
         LOGFIRE_BASE_URL, LOGFIRE_ENVIRONMENT, LOGFIRE_SEND_TO_LOGFIRE, LOGFIRE_SERVICE_NAME,
-        LOGFIRE_SERVICE_VERSION, LOGFIRE_TOKEN_VALUE, SendToLogfire, SharedIdGenerator,
+        LOGFIRE_SERVICE_VERSION, LOGFIRE_TOKEN_VALUE, OtlpEndpoint, SendToLogfire,
+        SharedIdGenerator,
     },
     internal::{
         exporters::console::{ConsoleWriter, create_console_processors},
+        filter_processors::{FilterLogProcessor, FilterSpanProcessor},
         log_processor_shutdown_hack::LogProcessorShutdownHack,
         logfire_tracer::{GLOBAL_TRACER, LOCAL_TRACER, LogfireTracer},
         pending_span_processor::PendingSpanProcessor,
@@ -410,21 +412,39 @@ impl Logfire {
             .clone()
             .unwrap_or_else(|| SharedIdGenerator::new(Arc::new(UlidIdGenerator::new())));
 
-        let shutdown_sender = if let Some(ref logfire_base_url) = logfire_base_url {
-            let (shutdown_tx, span_processor, log_processor, metrics_processor) =
-                spawn_runtime_and_exporters(
-                    logfire_base_url,
-                    http_headers,
-                    &advanced_options.export,
-                    config.metrics.is_some(),
-                )?;
+        let shutdown_sender = if logfire_base_url.is_some()
+            || !advanced_options.additional_endpoints.is_empty()
+        {
+            let ExportProcessors {
+                shutdown_tx,
+                logfire,
+                additional,
+            } = spawn_runtime_and_exporters(
+                logfire_base_url.as_deref().map(|url| (url, http_headers)),
+                advanced_options.additional_endpoints,
+                &advanced_options.export,
+                config.metrics.is_some(),
+            )?;
 
-            tracer_provider_builder = tracer_provider_builder.with_span_processor(
-                PendingSpanProcessor::new(span_processor, id_generator.clone()),
-            );
-            logger_provider_builder = logger_provider_builder.with_log_processor(log_processor);
-            if let Some(metrics_processor) = metrics_processor {
-                meter_provider_builder = meter_provider_builder.with_reader(metrics_processor);
+            if let Some((span_processor, log_processor, metrics_processor)) = logfire {
+                let min_level = advanced_options
+                    .min_export_level
+                    .map(tracing_level_to_severity);
+                tracer_provider_builder =
+                    tracer_provider_builder.with_span_processor(PendingSpanProcessor::new(
+                        FilterSpanProcessor::new(span_processor, min_level, None),
+                        id_generator.clone(),
+                    ));
+                logger_provider_builder = logger_provider_builder
+                    .with_log_processor(FilterLogProcessor::new(log_processor, min_level, None));
+                if let Some(metrics_processor) = metrics_processor {
+                    meter_provider_builder = meter_provider_builder.with_reader(metrics_processor);
+                }
+            }
+            for (span_processor, log_processor) in additional {
+                tracer_provider_builder =
+                    tracer_provider_builder.with_span_processor(span_processor);
+                logger_provider_builder = logger_provider_builder.with_log_processor(log_processor);
             }
 
             Arc::new(Mutex::new(Some(shutdown_tx)))
@@ -739,21 +759,12 @@ struct LogfireCredentials {
 /// It also has the benefit for the `grpc` export that the tonic channel can be created
 /// successfully in all cases; it _needs_ a tokio runtime and this way we don't need
 /// the user to call `logfire::configure` inside an async context.
-#[allow(clippy::type_complexity)] // internal type, not exposed to users
 fn spawn_runtime_and_exporters(
-    logfire_base_url: &str,
-    http_headers: Option<HashMap<String, String>>,
+    logfire_export: Option<(&str, Option<HashMap<String, String>>)>,
+    additional_endpoints: Vec<OtlpEndpoint>,
     export_options: &crate::exporters::ExportOptions,
     enable_metrics: bool,
-) -> Result<
-    (
-        tokio::sync::oneshot::Sender<()>,
-        BatchSpanProcessor<runtime::Tokio>,
-        LogProcessorShutdownHack<BatchLogProcessor<runtime::Tokio>>,
-        Option<PeriodicReader<impl PushMetricExporter + use<>>>,
-    ),
-    ConfigureError,
-> {
+) -> Result<ExportProcessors<impl PushMetricExporter + use<>>, ConfigureError> {
     thread_local! {
         static SUPPRESS_GUARD: RefCell<Option<opentelemetry::ContextGuard>> = const { RefCell::new(None) };
     }
@@ -794,7 +805,7 @@ fn spawn_runtime_and_exporters(
             ConfigureError::Other(format!("failed to create logfire exporter: {e:?}").into())
         })?;
 
-    let (span_processor, log_processor, metrics_processor) = std::thread::scope(|s| {
+    let (logfire, additional) = std::thread::scope(|s| {
         s.spawn(|| -> Result<_, ConfigureError> {
             // avoid telemetry logs being generated from exporter setup (or spans they create)
             let _ctx_guard = Context::enter_telemetry_suppressed_scope();
@@ -802,61 +813,112 @@ fn spawn_runtime_and_exporters(
             // all these processors spawn tasks on the runtime when they are created.
             let _rt_guard = handle.enter();
 
-            let span_processor = BatchSpanProcessor::builder(
-                crate::exporters::span_exporter_with_options(
-                    logfire_base_url,
-                    http_headers.clone(),
-                    export_options,
-                )?,
-                runtime::Tokio,
-            )
-            .with_batch_config(
-                BatchConfigBuilder::default()
-                    .with_scheduled_delay(Duration::from_millis(500)) // 500 matches Python
-                    .build(),
-            )
-            .build();
-
-            let log_processor = LogProcessorShutdownHack::new(
-                BatchLogProcessor::builder(
-                    crate::exporters::log_exporter_with_options(
-                        logfire_base_url,
-                        http_headers.clone(),
-                        export_options,
-                    )?,
-                    runtime::Tokio,
-                )
-                .build(),
-            );
-
-            let metrics_processor = if enable_metrics {
-                Some(
-                    PeriodicReader::builder(
-                        crate::exporters::metric_exporter_with_options(
+            let logfire = logfire_export
+                .map(
+                    |(logfire_base_url, http_headers)| -> Result<_, ConfigureError> {
+                        let (span_processor, log_processor) = batch_processors(
                             logfire_base_url,
-                            http_headers,
+                            http_headers.as_ref(),
                             export_options,
-                        )?,
-                        runtime::Tokio,
-                    )
-                    .build(),
-                )
-            } else {
-                None
-            };
+                        )?;
 
-            Ok((span_processor, log_processor, metrics_processor))
+                        let metrics_processor = if enable_metrics {
+                            Some(
+                                PeriodicReader::builder(
+                                    crate::exporters::metric_exporter_with_options(
+                                        logfire_base_url,
+                                        http_headers,
+                                        export_options,
+                                    )?,
+                                    runtime::Tokio,
+                                )
+                                .build(),
+                            )
+                        } else {
+                            None
+                        };
+
+                        Ok((span_processor, log_processor, metrics_processor))
+                    },
+                )
+                .transpose()?;
+
+            let additional = additional_endpoints
+                .into_iter()
+                .map(|endpoint| -> Result<_, ConfigureError> {
+                    let (span_processor, log_processor) = batch_processors(
+                        &endpoint.endpoint,
+                        Some(&endpoint.headers),
+                        export_options,
+                    )?;
+                    Ok((
+                        FilterSpanProcessor::new(span_processor, None, endpoint.span_filter),
+                        FilterLogProcessor::new(log_processor, None, endpoint.log_filter),
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok((logfire, additional))
         })
         .join()
         .map_err(|_| ConfigureError::Other("failed to create logfire processors".into()))?
     })?;
 
-    Ok((
+    Ok(ExportProcessors {
         shutdown_tx,
-        span_processor,
-        log_processor,
-        metrics_processor,
-    ))
+        logfire,
+        additional,
+    })
+}
+
+type BatchSpans = BatchSpanProcessor<runtime::Tokio>;
+type BatchLogs = LogProcessorShutdownHack<BatchLogProcessor<runtime::Tokio>>;
+
+/// The processors exporting from the runtime of [`spawn_runtime_and_exporters`].
+struct ExportProcessors<M: PushMetricExporter> {
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    logfire: Option<(BatchSpans, BatchLogs, Option<PeriodicReader<M>>)>,
+    additional: Vec<(
+        FilterSpanProcessor<BatchSpans>,
+        FilterLogProcessor<BatchLogs>,
+    )>,
+}
+
+/// Build the span and log batch processors exporting to `endpoint`. Must run inside the export
+/// runtime, where they spawn their tasks.
+fn batch_processors(
+    endpoint: &str,
+    http_headers: Option<&HashMap<String, String>>,
+    export_options: &crate::exporters::ExportOptions,
+) -> Result<(BatchSpans, BatchLogs), ConfigureError> {
+    let span_processor = BatchSpanProcessor::builder(
+        crate::exporters::span_exporter_with_options(
+            endpoint,
+            http_headers.cloned(),
+            export_options,
+        )?,
+        runtime::Tokio,
+    )
+    .with_batch_config(
+        BatchConfigBuilder::default()
+            .with_scheduled_delay(Duration::from_millis(500)) // 500 matches Python
+            .build(),
+    )
+    .build();
+
+    let log_processor = LogProcessorShutdownHack::new(
+        BatchLogProcessor::builder(
+            crate::exporters::log_exporter_with_options(
+                endpoint,
+                http_headers.cloned(),
+                export_options,
+            )?,
+            runtime::Tokio,
+        )
+        .build(),
+    );
+
+    Ok((span_processor, log_processor))
 }
 
 #[cfg(test)]

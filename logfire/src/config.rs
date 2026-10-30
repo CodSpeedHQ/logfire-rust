@@ -13,13 +13,20 @@ use std::{
 };
 
 use opentelemetry_sdk::{
-    logs::LogProcessor,
+    logs::{LogProcessor, SdkLogRecord},
     metrics::reader::MetricReader,
-    trace::{IdGenerator, SpanProcessor},
+    trace::{IdGenerator, SpanData, SpanProcessor},
 };
 use tracing::{Level, level_filters::LevelFilter};
 
-use crate::{ConfigureError, internal::env::get_optional_env, logfire::Logfire};
+use crate::{
+    ConfigureError,
+    internal::{
+        env::get_optional_env,
+        filter_processors::{LogFilter, SpanFilter},
+    },
+    logfire::Logfire,
+};
 
 /// Builder for logfire configuration, returned from [`logfire::configure()`][crate::configure].
 #[must_use = "call `.finish()` to complete logfire configuration."]
@@ -394,6 +401,8 @@ pub struct AdvancedOptions {
     pub(crate) log_record_processors: Vec<BoxedLogProcessor>,
     pub(crate) enable_tracing_metrics: bool,
     pub(crate) export: crate::exporters::ExportOptions,
+    pub(crate) min_export_level: Option<Level>,
+    pub(crate) additional_endpoints: Vec<OtlpEndpoint>,
     //
     //
     // TODO: arguments below supported by Python
@@ -439,6 +448,28 @@ impl AdvancedOptions {
         self
     }
 
+    /// Only send to Logfire the spans and logs at `level` or above.
+    ///
+    /// Unlike [`LogfireConfigBuilder::with_default_level_filter`], the lower levels are still
+    /// captured, for the console, additional span and log processors, and
+    /// [additional endpoints](Self::with_additional_endpoint).
+    #[must_use]
+    pub fn with_min_export_level(mut self, level: Level) -> Self {
+        self.min_export_level = Some(level);
+        self
+    }
+
+    /// Also export spans and logs over OTLP to another endpoint, with the same protocol and from
+    /// the same background runtime as the export to Logfire.
+    ///
+    /// The export happens whether or not data is sent to Logfire, and is flushed and shut down
+    /// with it. Metrics are not exported there.
+    #[must_use]
+    pub fn with_additional_endpoint(mut self, endpoint: OtlpEndpoint) -> Self {
+        self.additional_endpoints.push(endpoint);
+        self
+    }
+
     /// Support capturing tracing events as metrics as per [`tracing_opentelemetry::MetricsLayer`](https://docs.rs/tracing-opentelemetry/latest/tracing_opentelemetry/struct.MetricsLayer.html).
     #[must_use]
     pub fn with_tracing_metrics(mut self, enable: bool) -> Self {
@@ -464,6 +495,60 @@ impl AdvancedOptions {
         build: impl Fn(tonic::transport::Endpoint) -> tonic::transport::Channel + Send + Sync + 'static,
     ) -> Self {
         self.export.grpc_channel = Some(Arc::new(build));
+        self
+    }
+}
+
+/// An OTLP endpoint to export spans and logs to besides Logfire, see
+/// [`AdvancedOptions::with_additional_endpoint`].
+pub struct OtlpEndpoint {
+    pub(crate) endpoint: String,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) span_filter: Option<SpanFilter>,
+    pub(crate) log_filter: Option<LogFilter>,
+}
+
+impl OtlpEndpoint {
+    /// Export to `endpoint`, the base URL of an OTLP receiver (e.g. `http://localhost:4318`).
+    #[must_use]
+    pub fn new<T: Into<String>>(endpoint: T) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            headers: HashMap::new(),
+            span_filter: None,
+            log_filter: None,
+        }
+    }
+
+    /// Send the `name` header with every export request, e.g. `Authorization`.
+    #[must_use]
+    pub fn with_header<N: Into<String>, V: Into<String>>(mut self, name: N, value: V) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// Only export the spans for which `filter` returns `true`.
+    ///
+    /// `filter` may modify the span, e.g. to add attributes; the change only reaches this endpoint.
+    #[must_use]
+    pub fn with_span_filter<F>(mut self, filter: F) -> Self
+    where
+        F: Fn(&mut SpanData) -> bool + Send + Sync + 'static,
+    {
+        self.span_filter = Some(Arc::new(filter));
+        self
+    }
+
+    /// Only export the log records for which `filter` returns `true`.
+    ///
+    /// `filter` may modify the record, e.g. to add attributes; the change only reaches this
+    /// endpoint.
+    #[must_use]
+    pub fn with_log_filter<F>(mut self, filter: F) -> Self
+    where
+        F: Fn(&mut SdkLogRecord) -> bool + Send + Sync + 'static,
+    {
+        self.log_filter = Some(Arc::new(filter));
         self
     }
 }
