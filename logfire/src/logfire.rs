@@ -47,7 +47,7 @@ use crate::{
     },
     internal::{
         exporters::console::{ConsoleWriter, create_console_processors},
-        filter_processors::{FilterLogProcessor, FilterSpanProcessor},
+        filter_processors::{DroppedSpans, FilterLogProcessor, FilterSpanProcessor},
         log_processor_shutdown_hack::LogProcessorShutdownHack,
         logfire_tracer::{GLOBAL_TRACER, LOCAL_TRACER, LogfireTracer},
         pending_span_processor::PendingSpanProcessor,
@@ -430,13 +430,15 @@ impl Logfire {
                 let min_level = advanced_options
                     .min_export_level
                     .map(tracing_level_to_severity);
+                let dropped = DroppedSpans::default();
                 tracer_provider_builder =
                     tracer_provider_builder.with_span_processor(PendingSpanProcessor::new(
-                        FilterSpanProcessor::new(span_processor, min_level, None),
+                        FilterSpanProcessor::new(span_processor, min_level, None, dropped.clone()),
                         id_generator.clone(),
                     ));
-                logger_provider_builder = logger_provider_builder
-                    .with_log_processor(FilterLogProcessor::new(log_processor, min_level, None));
+                logger_provider_builder = logger_provider_builder.with_log_processor(
+                    FilterLogProcessor::new(log_processor, min_level, None, dropped),
+                );
                 if let Some(metrics_processor) = metrics_processor {
                     meter_provider_builder = meter_provider_builder.with_reader(metrics_processor);
                 }
@@ -852,8 +854,18 @@ fn spawn_runtime_and_exporters(
                         export_options,
                     )?;
                     Ok((
-                        FilterSpanProcessor::new(span_processor, None, endpoint.span_filter),
-                        FilterLogProcessor::new(log_processor, None, endpoint.log_filter),
+                        FilterSpanProcessor::new(
+                            span_processor,
+                            None,
+                            endpoint.span_filter,
+                            DroppedSpans::default(),
+                        ),
+                        FilterLogProcessor::new(
+                            log_processor,
+                            None,
+                            endpoint.log_filter,
+                            DroppedSpans::default(),
+                        ),
                     ))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
